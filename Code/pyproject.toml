@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "condiffplan"
+version = "0.1.0"
+description = "ConDiffPlan-style conditional vector floorplan diffusion model adapted for the ResPlan dataset"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0.0",
+    "numpy>=1.24.0",
+    "shapely>=2.0.0",
+    "networkx>=3.0",
+    "matplotlib>=3.7.0",
+    "tqdm>=4.65.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=7.4.0",
+]
+
+[project.scripts]
+condiff-preprocess = "condiffplan.data.preprocess:main"
+condiff-train = "condiffplan.train:main"
+condiff-sample = "condiffplan.sample:main"
+condiff-eval = "condiffplan.eval:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/condiffplan"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
