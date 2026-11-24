@@ -6,7 +6,9 @@ import argparse
 import copy
 import json
 import math
+import os
 import random
+import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterator, Optional
@@ -15,6 +17,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 from condiffplan.config import DataConfig, DiffusionConfig, ModelConfig, TrainConfig
 from condiffplan.data.dataset import ResPlanDiffusionDataset, collate_floorplans
@@ -22,6 +25,169 @@ from condiffplan.data.preprocess import preprocess_resplan_splits
 from condiffplan.model.diffusion import ConditionalGaussianDiffusion
 from condiffplan.model.transformer import ConDiffPlanTransformer
 from condiffplan.pipeline import resolve_device
+
+
+class _Ansi:
+    """Lightweight ANSI styling helper with automatic TTY/Colab/NO_COLOR detection."""
+
+    def __init__(self, enabled: Optional[bool] = None) -> None:
+        if enabled is None:
+            no_color = bool(os.environ.get("NO_COLOR"))
+            in_notebook = bool(
+                os.environ.get("COLAB_GPU")
+                or os.environ.get("COLAB_RELEASE_TAG")
+                or os.environ.get("JPY_PARENT_PID")
+            )
+            enabled = (not no_color) and (sys.stdout.isatty() or in_notebook)
+        self.enabled = enabled
+
+    def _wrap(self, code: str, text: str) -> str:
+        return f"\033[{code}m{text}\033[0m" if self.enabled else text
+
+    def bold(self, text: str) -> str:
+        return self._wrap("1", text)
+
+    def dim(self, text: str) -> str:
+        return self._wrap("2", text)
+
+    def cyan(self, text: str) -> str:
+        return self._wrap("36", text)
+
+    def green(self, text: str) -> str:
+        return self._wrap("32", text)
+
+    def yellow(self, text: str) -> str:
+        return self._wrap("33", text)
+
+    def magenta(self, text: str) -> str:
+        return self._wrap("35", text)
+
+    def bold_cyan(self, text: str) -> str:
+        return self._wrap("1;36", text)
+
+    def bold_green(self, text: str) -> str:
+        return self._wrap("1;32", text)
+
+
+def _format_duration(seconds: float) -> str:
+    """Format seconds into a compact human-readable duration (e.g., 1h 23m 45s)."""
+    if not math.isfinite(seconds) or seconds < 0:
+        return "--:--"
+    total = int(round(seconds))
+    days, rem = divmod(total, 86400)
+    hours, rem = divmod(rem, 3600)
+    mins, secs = divmod(rem, 60)
+    if days > 0:
+        return f"{days}d {hours:02d}h {mins:02d}m"
+    if hours > 0:
+        return f"{hours}h {mins:02d}m {secs:02d}s"
+    if mins > 0:
+        return f"{mins}m {secs:02d}s"
+    return f"{secs}s"
+
+
+def _format_params(num_params: int) -> str:
+    if num_params >= 1_000_000:
+        return f"{num_params / 1_000_000:.2f}M"
+    if num_params >= 1_000:
+        return f"{num_params / 1_000:.1f}K"
+    return str(num_params)
+
+
+def _device_summary(device: torch.device) -> str:
+    if device.type == "cuda":
+        idx = device.index if device.index is not None else torch.cuda.current_device()
+        props = torch.cuda.get_device_properties(idx)
+        vram_gb = props.total_memory / (1024 ** 3)
+        return f"CUDA:{idx} · {props.name} ({vram_gb:.1f} GB)"
+    return device.type.upper()
+
+
+def _vram_usage_str(device: torch.device) -> str:
+    if device.type != "cuda":
+        return "—"
+    alloc_gb = torch.cuda.memory_allocated(device) / (1024 ** 3)
+    peak_gb = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+    return f"{alloc_gb:.2f}/{peak_gb:.2f}G"
+
+
+def _print_banner(
+    ansi: _Ansi,
+    device: torch.device,
+    use_amp: bool,
+    model_cfg: ModelConfig,
+    diff_cfg: DiffusionConfig,
+    train_cfg: TrainConfig,
+    num_params: int,
+    train_size: int,
+    val_size: int,
+    start_step: int,
+    resume_path: Optional[str],
+) -> None:
+    title = " ConDiffPlan · Vector Floorplan Diffusion Training "
+    rows = [
+        ("Hardware", f"{_device_summary(device)}  |  Precision: {'AMP (FP16)' if use_amp else 'FP32'}"),
+        (
+            "Model",
+            f"{model_cfg.n_layers}L × {model_cfg.d_model}d × {model_cfg.n_heads}H "
+            f"({_format_params(num_params)} params)  |  T={diff_cfg.num_timesteps} ({diff_cfg.schedule})",
+        ),
+        ("Dataset", f"Train: {train_size:,} plans  |  Val: {val_size:,} plans  |  Batch: {train_cfg.batch_size}"),
+        (
+            "Schedule",
+            f"Steps: {start_step:,} → {train_cfg.total_steps:,}  |  "
+            f"LR: {train_cfg.lr:.1e} → {train_cfg.lr_min:.1e}  |  EMA: {train_cfg.ema_decay}",
+        ),
+        (
+            "Checkpoints",
+            f"{train_cfg.checkpoint_dir}  (val every {train_cfg.val_every:,}, save every {train_cfg.save_every:,})",
+        ),
+    ]
+    if resume_path is not None and start_step > 0:
+        rows.append(("Resumed", f"{resume_path} (step {start_step:,})"))
+
+    max_row_len = max(len(f" {label:<13} {val} ") for label, val in rows)
+    width = max(78, max_row_len + 2, len(title) + 4)
+    border_top = f"╭{'─' * (width - 2)}╮"
+    border_mid = f"├{'─' * (width - 2)}┤"
+    border_bot = f"╰{'─' * (width - 2)}╯"
+
+    def _row(label: str, value: str) -> str:
+        plain_label = f"{label:<13}"
+        content = f" {plain_label} {value}"
+        pad = max(width - 2 - len(content), 0)
+        return f"{ansi.dim('│')} {ansi.cyan(plain_label)} {value}{' ' * pad}{ansi.dim('│')}"
+
+    title_pad = max(width - 2 - len(title), 0)
+    left_pad = title_pad // 2
+    right_pad = title_pad - left_pad
+
+    lines = [
+        "",
+        ansi.dim(border_top),
+        f"{ansi.dim('│')}{' ' * left_pad}{ansi.bold_cyan(title)}{' ' * right_pad}{ansi.dim('│')}",
+        ansi.dim(border_mid),
+        *(_row(label, val) for label, val in rows),
+        ansi.dim(border_bot),
+    ]
+    print("\n".join(lines), flush=True)
+
+
+def _table_header(ansi: _Ansi, show_vram: bool) -> str:
+    cols = [
+        f"{'Step':>17}",
+        f"{'Prog':>6}",
+        f"{'Loss':>9}",
+        f"{'Grad':>7}",
+        f"{'LR':>9}",
+        f"{'Speed':>10}",
+    ]
+    if show_vram:
+        cols.append(f"{'VRAM':>11}")
+    cols.extend([f"{'Elapsed':>10}", f"{'ETA':>10}"])
+    header = " │ ".join(cols)
+    sep = "─" * len(header)
+    return f"{ansi.bold(header)}\n{ansi.dim(sep)}"
 
 
 class EMA:
@@ -213,57 +379,170 @@ def run_training(
 
     model.train()
     data_iter = infinite_loader(train_loader)
+    ansi = _Ansi()
+    show_vram = device.type == "cuda"
+    num_params = sum(p.numel() for p in model.parameters())
+
+    _print_banner(
+        ansi=ansi,
+        device=device,
+        use_amp=use_amp,
+        model_cfg=model_cfg,
+        diff_cfg=diff_cfg,
+        train_cfg=train_cfg,
+        num_params=num_params,
+        train_size=len(train_dataset),
+        val_size=len(val_dataset),
+        start_step=start_step,
+        resume_path=resume_path,
+    )
+    print(_table_header(ansi, show_vram=show_vram), flush=True)
+
     t0 = time.time()
+    interval_t0 = t0
+    interval_steps = 0
     running_loss = 0.0
+    running_grad_norm = 0.0
     running_count = 0
+    total_steps = train_cfg.total_steps
 
-    for step in range(start_step + 1, train_cfg.total_steps + 1):
-        lr_now = exponential_lr(step, train_cfg.total_steps, train_cfg.lr, train_cfg.lr_min)
-        for pg in optimizer.param_groups:
-            pg["lr"] = lr_now
+    pbar = tqdm(
+        range(start_step + 1, total_steps + 1),
+        initial=start_step,
+        total=total_steps,
+        desc="Training",
+        unit="step",
+        dynamic_ncols=True,
+        leave=False,
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]",
+    )
 
-        batch = next(data_iter)
-        dev_batch = {k: batch[k].to(device, non_blocking=True) for k in tensor_keys}
+    try:
+        for step in pbar:
+            lr_now = exponential_lr(step, total_steps, train_cfg.lr, train_cfg.lr_min)
+            for pg in optimizer.param_groups:
+                pg["lr"] = lr_now
 
-        optimizer.zero_grad(set_to_none=True)
-        with torch.amp.autocast("cuda", enabled=use_amp):
-            loss = diffusion.training_loss(model, dev_batch)
+            batch = next(data_iter)
+            dev_batch = {k: batch[k].to(device, non_blocking=True) for k in tensor_keys}
 
-        if not torch.isfinite(loss):
-            raise RuntimeError(f"Non-finite training loss encountered at step {step}: {loss.item()}")
+            optimizer.zero_grad(set_to_none=True)
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                loss = diffusion.training_loss(model, dev_batch)
 
-        scaler.scale(loss).backward()
-        if train_cfg.grad_clip > 0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.grad_clip)
-        scaler.step(optimizer)
-        scaler.update()
+            if not torch.isfinite(loss):
+                raise RuntimeError(f"Non-finite training loss encountered at step {step}: {loss.item()}")
 
-        ema.update(model)
+            scaler.scale(loss).backward()
+            grad_norm_val = 0.0
+            if train_cfg.grad_clip > 0:
+                scaler.unscale_(optimizer)
+                gn = torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.grad_clip)
+                grad_norm_val = float(gn.item()) if torch.is_tensor(gn) else float(gn)
+            scaler.step(optimizer)
+            scaler.update()
 
-        running_loss += float(loss.item())
-        running_count += 1
+            ema.update(model)
 
-        if step % train_cfg.log_every == 0 or step == 1 or step == train_cfg.total_steps:
-            avg_loss = running_loss / max(running_count, 1)
-            elapsed = time.time() - t0
-            print(
-                f"[Step {step}/{train_cfg.total_steps}] "
-                f"loss={avg_loss:.5f} lr={lr_now:.2e} device={device.type} ({elapsed:.1f}s)"
-            )
-            running_loss = 0.0
-            running_count = 0
+            loss_val = float(loss.item())
+            running_loss += loss_val
+            running_grad_norm += grad_norm_val
+            running_count += 1
+            interval_steps += 1
 
-        if step % train_cfg.val_every == 0 or step == train_cfg.total_steps:
-            val_loss = evaluate_validation_loss(ema.shadow, diffusion, val_loader, device)
-            print(f"  -> Validation loss at step {step}: {val_loss:.5f}")
-            if val_loss <= best_val_loss:
-                best_val_loss = val_loss
-                _save_ckpt(best_ckpt_path, step, val_loss)
-            _save_ckpt(latest_ckpt_path, step, val_loss)
+            postfix: Dict[str, str] = {"loss": f"{loss_val:.4f}", "lr": f"{lr_now:.1e}"}
+            if show_vram:
+                postfix["vram"] = _vram_usage_str(device)
+            pbar.set_postfix(postfix, refresh=False)
 
-        if step % train_cfg.save_every == 0:
-            _save_ckpt(ckpt_dir / f"step_{step}.pt", step, best_val_loss)
+            if step % train_cfg.log_every == 0 or step == start_step + 1 or step == total_steps:
+                now = time.time()
+                avg_loss = running_loss / max(running_count, 1)
+                avg_grad = running_grad_norm / max(running_count, 1)
+                elapsed = now - t0
+                steps_done = step - start_step
+                interval_dt = max(now - interval_t0, 1e-6)
+                speed = interval_steps / interval_dt
+                avg_speed = steps_done / max(elapsed, 1e-6)
+                eta = (total_steps - step) / max(avg_speed, 1e-9)
+                pct = 100.0 * step / max(total_steps, 1)
+
+                step_str = f"{step:>7,}/{total_steps:<9,}"
+                row_cols = [
+                    ansi.bold(step_str),
+                    f"{pct:5.1f}%",
+                    ansi.yellow(f"{avg_loss:9.5f}"),
+                    f"{avg_grad:7.3f}" if train_cfg.grad_clip > 0 else f"{'—':>7}",
+                    ansi.dim(f"{lr_now:9.2e}"),
+                    f"{speed:5.1f} it/s",
+                ]
+                if show_vram:
+                    row_cols.append(ansi.magenta(f"{_vram_usage_str(device):>11}"))
+                row_cols.extend([
+                    ansi.dim(f"{_format_duration(elapsed):>10}"),
+                    ansi.cyan(f"{_format_duration(eta):>10}"),
+                ])
+                tqdm.write(" │ ".join(row_cols))
+
+                running_loss = 0.0
+                running_grad_norm = 0.0
+                running_count = 0
+                interval_t0 = now
+                interval_steps = 0
+
+            if step % train_cfg.val_every == 0 or step == total_steps:
+                val_loss = evaluate_validation_loss(ema.shadow, diffusion, val_loader, device)
+                prev_best = best_val_loss
+                is_best = val_loss <= best_val_loss
+                if is_best:
+                    best_val_loss = val_loss
+                    _save_ckpt(best_ckpt_path, step, val_loss)
+                _save_ckpt(latest_ckpt_path, step, val_loss)
+
+                if is_best:
+                    delta_str = (
+                        f" (↓ {prev_best - val_loss:.5f} new best!)"
+                        if math.isfinite(prev_best)
+                        else " (initial best)"
+                    )
+                    tag = ansi.bold_green("  ✓ VAL ")
+                    val_txt = ansi.bold_green(f"{val_loss:.5f}{delta_str}")
+                    saved_txt = "saved best.pt, latest.pt"
+                else:
+                    tag = ansi.cyan("  • VAL ")
+                    val_txt = f"{val_loss:.5f} (best: {best_val_loss:.5f})"
+                    saved_txt = "saved latest.pt"
+
+                tqdm.write(f"{tag} step {step:,} │ val_loss {val_txt} │ {ansi.dim(saved_txt)}")
+
+            if step % train_cfg.save_every == 0:
+                milestone_path = ckpt_dir / f"step_{step}.pt"
+                _save_ckpt(milestone_path, step, best_val_loss)
+                tqdm.write(
+                    f"{ansi.magenta('  ★ CKPT')} step {step:,} │ {ansi.dim(f'saved {milestone_path.name}')}"
+                )
+    finally:
+        pbar.close()
+
+    total_elapsed = time.time() - t0
+    completed_steps = max(total_steps - start_step, 0)
+    avg_it_s = completed_steps / max(total_elapsed, 1e-6)
+    summary_line = "─" * 78
+    best_str = f"{best_val_loss:.5f}" if math.isfinite(best_val_loss) else "n/a"
+    print(
+        "\n".join(
+            [
+                ansi.dim(summary_line),
+                f"{ansi.bold_green('✓ Training Complete')}  │  "
+                f"Steps: {total_steps:,}  │  "
+                f"Best Val Loss: {ansi.bold_green(best_str)}  │  "
+                f"Time: {_format_duration(total_elapsed)} ({avg_it_s:.1f} it/s)",
+                f"  {ansi.dim('Latest:')} {latest_ckpt_path}    {ansi.dim('Best:')} {best_ckpt_path}",
+                ansi.dim(summary_line),
+            ]
+        ),
+        flush=True,
+    )
 
     return latest_ckpt_path
 
