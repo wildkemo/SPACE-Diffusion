@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import gc
 import json
 import os
 import pickle
@@ -378,25 +379,27 @@ def resplan_to_floorplan_graph(plan: Dict[str, Any], cfg: Optional[DataConfig] =
     return raw_graph_obj.normalized_copy()
 
 
-def compute_corner_stats(graphs: Sequence[FloorplanGraph]) -> Dict[str, Dict[int, int]]:
-    """Compute empirical corner-count frequency distribution per element type."""
-    counts: Dict[str, collections.Counter] = {t: collections.Counter() for t in ELEM_TYPES}
-    for g in graphs:
-        if g.boundary is not None and g.boundary.num_corners is not None:
-            counts["boundary"][int(g.boundary.num_corners)] += 1
-        for n in g.nodes:
-            if n.num_corners is not None:
-                counts[n.type][int(n.num_corners)] += 1
-            if n.has_front_door:
-                counts["front_door"][4] += 1
-            if n.num_exterior_windows > 0:
-                counts["window"][4] += n.num_exterior_windows
-        for e in g.edges:
-            if e.type == "via_door":
-                counts["door"][4] += e.count
-            elif e.type == "via_window":
-                counts["window"][4] += e.count
+def _accumulate_corner_stats(
+    counts: Dict[str, collections.Counter],
+    g: FloorplanGraph,
+) -> None:
+    if g.boundary is not None and g.boundary.num_corners is not None:
+        counts["boundary"][int(g.boundary.num_corners)] += 1
+    for n in g.nodes:
+        if n.num_corners is not None:
+            counts[n.type][int(n.num_corners)] += 1
+        if n.has_front_door:
+            counts["front_door"][4] += 1
+        if n.num_exterior_windows > 0:
+            counts["window"][4] += n.num_exterior_windows
+    for e in g.edges:
+        if e.type == "via_door":
+            counts["door"][4] += e.count
+        elif e.type == "via_window":
+            counts["window"][4] += e.count
 
+
+def _finalize_corner_stats(counts: Dict[str, collections.Counter]) -> Dict[str, Dict[int, int]]:
     result: Dict[str, Dict[int, int]] = {}
     for t in ELEM_TYPES:
         if counts[t]:
@@ -404,6 +407,20 @@ def compute_corner_stats(graphs: Sequence[FloorplanGraph]) -> Dict[str, Dict[int
         else:
             result[t] = {DEFAULT_CORNER_COUNTS[t]: 1}
     return result
+
+
+def compute_corner_stats(graphs: Sequence[FloorplanGraph]) -> Dict[str, Dict[int, int]]:
+    """Compute empirical corner-count frequency distribution per element type."""
+    counts: Dict[str, collections.Counter] = {t: collections.Counter() for t in ELEM_TYPES}
+    for g in graphs:
+        _accumulate_corner_stats(counts, g)
+    return _finalize_corner_stats(counts)
+
+
+def _atomic_torch_save(obj: Any, path: Path) -> None:
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    torch.save(obj, tmp_path)
+    os.replace(tmp_path, path)
 
 
 def preprocess_resplan_splits(
@@ -421,13 +438,20 @@ def preprocess_resplan_splits(
     with open(cfg.split_path, "r") as f:
         splits: Dict[str, List[int]] = json.load(f)
 
-    with open(cfg.data_path, "rb") as f:
+    data_path = Path(cfg.data_path)
+    if show_progress and data_path.exists():
+        size_mb = data_path.stat().st_size / (1024 ** 2)
+        print(f"Loading {data_path.name} ({size_mb:.1f} MB) from disk...", flush=True)
+
+    with open(data_path, "rb") as f:
         raw_plans: List[Dict[str, Any]] = pickle.load(f)
 
     plan_by_id: Dict[int, Dict[str, Any]] = {int(p["id"]): p for p in raw_plans}
+    del raw_plans
+    gc.collect()
 
     saved_paths: Dict[str, Path] = {}
-    train_graphs_for_stats: List[FloorplanGraph] = []
+    train_corner_counts: Dict[str, collections.Counter] = {t: collections.Counter() for t in ELEM_TYPES}
 
     split_names = ["train", "val", "test"]
     if cfg.include_augmented_split and "augmented" in splits:
@@ -447,14 +471,21 @@ def preprocess_resplan_splits(
             fg = resplan_to_floorplan_graph(plan, cfg=cfg)
             serialized_graphs.append(fg.to_dict())
             if sname == "train":
-                train_graphs_for_stats.append(fg)
+                _accumulate_corner_stats(train_corner_counts, fg)
 
         out_path = cache_dir / f"{sname}.pt"
-        torch.save(serialized_graphs, out_path)
+        if show_progress:
+            print(f"Saving {out_path} ({len(serialized_graphs):,} plans)...", flush=True)
+        _atomic_torch_save(serialized_graphs, out_path)
         saved_paths[sname] = out_path
+        del serialized_graphs
+        gc.collect()
+
+    del plan_by_id
+    gc.collect()
 
     # Save empirical corner count distribution
-    corner_stats = compute_corner_stats(train_graphs_for_stats)
+    corner_stats = _finalize_corner_stats(train_corner_counts)
     stats_path = cache_dir / "corner_stats.json"
     with open(stats_path, "w") as f:
         json.dump(corner_stats, f, indent=2)

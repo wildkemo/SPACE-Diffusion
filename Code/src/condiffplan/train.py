@@ -7,8 +7,10 @@ import copy
 import json
 import math
 import os
+import queue
 import random
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterator, Optional
@@ -190,6 +192,57 @@ def _table_header(ansi: _Ansi, show_vram: bool) -> str:
     return f"{ansi.bold(header)}\n{ansi.dim(sep)}"
 
 
+class _AsyncCheckpointSaver:
+    """Background atomic checkpoint writer so slow HDD I/O never freezes training."""
+
+    def __init__(self) -> None:
+        self._q: "queue.Queue[Optional[tuple[Path, Dict[str, Any]]]]" = queue.Queue(maxsize=2)
+        self._error: Optional[BaseException] = None
+        self._thread = threading.Thread(target=self._worker, name="ckpt-saver", daemon=True)
+        self._thread.start()
+
+    @staticmethod
+    def _to_cpu_clone(obj: Any) -> Any:
+        if torch.is_tensor(obj):
+            return obj.detach().to(device="cpu").clone()
+        if isinstance(obj, dict):
+            return {k: _AsyncCheckpointSaver._to_cpu_clone(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_AsyncCheckpointSaver._to_cpu_clone(v) for v in obj]
+        if isinstance(obj, tuple):
+            return tuple(_AsyncCheckpointSaver._to_cpu_clone(v) for v in obj)
+        return obj
+
+    def _worker(self) -> None:
+        while True:
+            item = self._q.get()
+            if item is None:
+                self._q.task_done()
+                break
+            path, payload = item
+            try:
+                tmp_path = path.with_suffix(path.suffix + ".tmp")
+                torch.save(payload, tmp_path)
+                os.replace(tmp_path, path)
+            except BaseException as exc:
+                self._error = exc
+            finally:
+                self._q.task_done()
+
+    def save(self, path: Path, payload: Dict[str, Any]) -> None:
+        if self._error is not None:
+            raise self._error
+        cpu_payload = self._to_cpu_clone(payload)
+        self._q.put((path, cpu_payload))
+
+    def close(self) -> None:
+        self._q.put(None)
+        self._q.join()
+        self._thread.join(timeout=60.0)
+        if self._error is not None:
+            raise self._error
+
+
 class EMA:
     """Exponential Moving Average of model parameters for higher sampling stability."""
 
@@ -295,18 +348,33 @@ def run_training(
             raw_stats = json.load(f)
         corner_stats = {t: {int(k): int(v) for k, v in d.items()} for t, d in raw_stats.items()}
 
-    train_dataset = ResPlanDiffusionDataset(train_pt, cfg=data_cfg, is_train=True)
-    val_dataset = ResPlanDiffusionDataset(val_pt, cfg=data_cfg, is_train=False)
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=min(train_cfg.batch_size, len(train_dataset)),
-        shuffle=True,
-        num_workers=train_cfg.num_workers if device.type == "cuda" else 0,
-        collate_fn=collate_floorplans,
-        pin_memory=(device.type == "cuda"),
-        drop_last=(len(train_dataset) >= train_cfg.batch_size),
+    print(f"Loading cached splits from {cache_dir}...", flush=True)
+    train_dataset = ResPlanDiffusionDataset(
+        train_pt, cfg=data_cfg, is_train=True, include_metadata=False
     )
+    val_dataset = ResPlanDiffusionDataset(
+        val_pt, cfg=data_cfg, is_train=False, include_metadata=False
+    )
+
+    # On Windows (spawn), multi-worker DataLoaders reload the entire dataset per worker
+    # and can thrash HDD/RAM; default to 0 there unless overridden.
+    effective_workers = train_cfg.num_workers if device.type == "cuda" else 0
+    if os.name == "nt" and train_cfg.num_workers == TrainConfig.num_workers:
+        effective_workers = 0
+
+    loader_kwargs: Dict[str, Any] = {
+        "batch_size": min(train_cfg.batch_size, len(train_dataset)),
+        "shuffle": True,
+        "num_workers": effective_workers,
+        "collate_fn": collate_floorplans,
+        "pin_memory": (device.type == "cuda"),
+        "drop_last": (len(train_dataset) >= train_cfg.batch_size),
+    }
+    if effective_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = 2
+
+    train_loader = DataLoader(train_dataset, **loader_kwargs)
     val_loader = DataLoader(
         val_dataset,
         batch_size=min(train_cfg.batch_size, len(val_dataset)),
@@ -332,6 +400,7 @@ def run_training(
     best_val_loss = float("inf")
 
     if resume_path is not None and Path(resume_path).exists():
+        print(f"Resuming checkpoint from {resume_path}...", flush=True)
         ckpt = torch.load(resume_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"])
         if "ema_state_dict" in ckpt:
@@ -345,22 +414,29 @@ def run_training(
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     latest_ckpt_path = ckpt_dir / "latest.pt"
     best_ckpt_path = ckpt_dir / "best.pt"
+    ckpt_saver = _AsyncCheckpointSaver()
 
-    def _save_ckpt(path: Path, step: int, val_loss: float) -> None:
-        payload = {
+    def _save_ckpt(
+        path: Path,
+        step: int,
+        val_loss: float,
+        include_optimizer: bool = True,
+    ) -> None:
+        payload: Dict[str, Any] = {
             "step": step,
             "best_val_loss": best_val_loss,
             "val_loss": val_loss,
             "model_state_dict": model.state_dict(),
             "ema_state_dict": ema.shadow.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
             "model_config": model_cfg.to_dict(),
             "diffusion_config": diff_cfg.to_dict(),
             "data_config": data_cfg.to_dict(),
             "train_config": train_cfg.to_dict(),
             "corner_stats": corner_stats,
         }
-        torch.save(payload, path)
+        if include_optimizer:
+            payload["optimizer_state_dict"] = optimizer.state_dict()
+        ckpt_saver.save(path, payload)
 
     tensor_keys = [
         "coords",
@@ -496,8 +572,8 @@ def run_training(
                 is_best = val_loss <= best_val_loss
                 if is_best:
                     best_val_loss = val_loss
-                    _save_ckpt(best_ckpt_path, step, val_loss)
-                _save_ckpt(latest_ckpt_path, step, val_loss)
+                    _save_ckpt(best_ckpt_path, step, val_loss, include_optimizer=False)
+                _save_ckpt(latest_ckpt_path, step, val_loss, include_optimizer=True)
 
                 if is_best:
                     delta_str = (
@@ -517,12 +593,13 @@ def run_training(
 
             if step % train_cfg.save_every == 0:
                 milestone_path = ckpt_dir / f"step_{step}.pt"
-                _save_ckpt(milestone_path, step, best_val_loss)
+                _save_ckpt(milestone_path, step, best_val_loss, include_optimizer=False)
                 tqdm.write(
                     f"{ansi.magenta('  ★ CKPT')} step {step:,} │ {ansi.dim(f'saved {milestone_path.name}')}"
                 )
     finally:
         pbar.close()
+        ckpt_saver.close()
 
     total_elapsed = time.time() - t0
     completed_steps = max(total_steps - start_step, 0)
@@ -560,6 +637,7 @@ def main() -> None:
     parser.add_argument("--lr-min", type=float, default=1e-6)
     parser.add_argument("--timesteps", type=int, default=1000)
     parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument("--num-workers", type=int, default=0 if os.name == "nt" else 2)
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--smoke-test", action="store_true", help="Fast CPU smoke test on 32 plans for 5 steps")
@@ -609,6 +687,7 @@ def main() -> None:
         lr=args.lr,
         lr_min=args.lr_min,
         total_steps=args.steps,
+        num_workers=args.num_workers,
         checkpoint_dir=args.checkpoint_dir,
         seed=args.seed,
     )

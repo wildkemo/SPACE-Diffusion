@@ -408,10 +408,12 @@ class ResPlanDiffusionDataset(Dataset):
         graphs_or_cache_path: Union[str, Path, Sequence[Union[FloorplanGraph, Dict[str, Any]]]],
         cfg: Optional[DataConfig] = None,
         is_train: bool = True,
+        include_metadata: bool = True,
     ) -> None:
         super().__init__()
         self.cfg = cfg or DataConfig()
         self.is_train = is_train
+        self.include_metadata = include_metadata
 
         if isinstance(graphs_or_cache_path, (str, Path)):
             raw_list = torch.load(graphs_or_cache_path, weights_only=False)
@@ -422,6 +424,7 @@ class ResPlanDiffusionDataset(Dataset):
             g if isinstance(g, FloorplanGraph) else FloorplanGraph.from_dict(g)
             for g in raw_list
         ]
+        del raw_list
 
     def __len__(self) -> int:
         return len(self.graphs)
@@ -501,7 +504,7 @@ class ResPlanDiffusionDataset(Dataset):
             num_elements=len(manifest),
         )
 
-        return {
+        sample: Dict[str, Any] = {
             "coords": torch.from_numpy(coords),
             "elem_type": torch.from_numpy(elem_type),
             "elem_idx": torch.from_numpy(elem_idx),
@@ -513,9 +516,11 @@ class ResPlanDiffusionDataset(Dataset):
             "room_mask": torch.from_numpy(room_mask),
             "rel_mask": torch.from_numpy(rel_mask),
             "rel_edge_type": torch.from_numpy(rel_edge_type),
-            "manifest": manifest,
-            "graph": expanded["graph"],
         }
+        if self.include_metadata:
+            sample["manifest"] = manifest
+            sample["graph"] = expanded["graph"]
+        return sample
 
 
 def collate_floorplans(batch: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
@@ -542,6 +547,7 @@ def collate_floorplans(batch: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     room_mask[:, diag_idx, diag_idx] = True
     rel_mask[:, diag_idx, diag_idx] = True
 
+    has_meta = "manifest" in batch[0] and "graph" in batch[0]
     manifests: List[List[ElementManifestItem]] = []
     graphs: List[FloorplanGraph] = []
 
@@ -564,10 +570,11 @@ def collate_floorplans(batch: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         rel_mask[i, :m, :m] = item["rel_mask"]
         rel_edge_type[i, :m, :m] = item["rel_edge_type"]
 
-        manifests.append(item["manifest"])
-        graphs.append(item["graph"])
+        if has_meta:
+            manifests.append(item["manifest"])
+            graphs.append(item["graph"])
 
-    return {
+    out: Dict[str, Any] = {
         "coords": coords,
         "elem_type": elem_type,
         "elem_idx": elem_idx,
@@ -580,6 +587,8 @@ def collate_floorplans(batch: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         "room_mask": room_mask,
         "rel_mask": rel_mask,
         "rel_edge_type": rel_edge_type,
-        "manifests": manifests,
-        "graphs": graphs,
     }
+    if has_meta:
+        out["manifests"] = manifests
+        out["graphs"] = graphs
+    return out
