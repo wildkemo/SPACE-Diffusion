@@ -181,6 +181,9 @@ class TrainConfig:
     log_every: int = 100
     val_every: int = 2_000
     save_every: int = 10_000
+    early_stop_patience: int = 0       # 0 = disabled; N = stop after N val checks without improvement
+    early_stop_min_delta: float = 1e-4
+    early_stop_min_steps: int = 50_000
     checkpoint_dir: str = "checkpoints"
     seed: int = 42
 

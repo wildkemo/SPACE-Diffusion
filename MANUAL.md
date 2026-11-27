@@ -38,6 +38,9 @@ cd Code
    # Resume from latest checkpoint (also upgrades legacy continuous-only checkpoints seamlessly)
    python train.py --preset default --batch-size 64 --steps 500000 --resume checkpoints/latest.pt
 
+   # Optional early stopping (stops if deterministic val_loss plateaus for 25 checks = 50k steps, after 100k min steps)
+   python train.py --preset default --batch-size 64 --steps 500000 --compile --early-stop-patience 25 --early-stop-min-steps 100000
+
    # Quick CPU smoke test
    python train.py --smoke-test
    ```

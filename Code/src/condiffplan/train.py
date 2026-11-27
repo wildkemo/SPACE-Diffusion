@@ -318,13 +318,20 @@ def evaluate_validation_loss(
 ) -> float:
     model.eval()
     losses = []
-    for i, batch in enumerate(val_loader):
-        if i >= max_batches:
-            break
-        dev_batch = {k: v.to(device, non_blocking=True) for k, v in batch.items() if torch.is_tensor(v)}
-        with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
-            loss = diffusion.training_loss(model, dev_batch)
-        losses.append(float(loss.item()))
+    # Fork RNG with fixed seed so val_loss uses identical (t, noise) draws across checks,
+    # eliminating Monte Carlo jitter for accurate best.pt selection and early stopping.
+    devices = [device] if device.type == "cuda" else []
+    with torch.random.fork_rng(devices=devices, enabled=True):
+        torch.manual_seed(0)
+        if device.type == "cuda":
+            torch.cuda.manual_seed_all(0)
+        for i, batch in enumerate(val_loader):
+            if i >= max_batches:
+                break
+            dev_batch = {k: v.to(device, non_blocking=True) for k, v in batch.items() if torch.is_tensor(v)}
+            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
+                loss = diffusion.training_loss(model, dev_batch)
+            losses.append(float(loss.item()))
     model.train()
     return float(np.mean(losses)) if losses else 0.0
 
@@ -520,6 +527,8 @@ def run_training(
     t0 = time.time()
     interval_t0 = t0
     interval_steps = 0
+    ema_speed: Optional[float] = None
+    no_improve_evals = 0
     # Accumulate metrics on-device to avoid per-step CPU-GPU sync stalls
     running_loss_t = torch.zeros((), device=device, dtype=torch.float32)
     running_grad_t = torch.zeros((), device=device, dtype=torch.float32)
@@ -625,11 +634,13 @@ def run_training(
                 pbar.set_postfix(postfix, refresh=False)
 
                 elapsed = now - t0
-                steps_done = step - start_step
                 interval_dt = max(now - interval_t0, 1e-6)
                 speed = interval_steps / interval_dt
-                avg_speed = steps_done / max(elapsed, 1e-6)
-                eta = (total_steps - step) / max(avg_speed, 1e-9)
+                # Ignore step-1 warmup (e.g. torch.compile JIT) in steady-state ETA smoothing
+                if step > start_step + 1:
+                    ema_speed = speed if ema_speed is None else (0.7 * ema_speed + 0.3 * speed)
+                eta_speed = ema_speed if ema_speed is not None else speed
+                eta = (total_steps - step) / max(eta_speed, 1e-9)
                 pct = 100.0 * step / max(total_steps, 1)
 
                 step_str = f"{step:>7,}/{total_steps:<9,}"
@@ -665,10 +676,14 @@ def run_training(
                     use_amp=hw.use_amp,
                 )
                 prev_best = best_val_loss
-                is_best = val_loss <= best_val_loss
+                is_best = val_loss < (best_val_loss - train_cfg.early_stop_min_delta) or not math.isfinite(best_val_loss)
                 if is_best:
                     best_val_loss = val_loss
+                    no_improve_evals = 0
                     _save_ckpt(best_ckpt_path, step, val_loss, include_optimizer=False)
+                else:
+                    if step >= train_cfg.early_stop_min_steps:
+                        no_improve_evals += 1
                 _save_ckpt(latest_ckpt_path, step, val_loss, include_optimizer=True)
 
                 if is_best:
@@ -686,6 +701,19 @@ def run_training(
                     saved_txt = "saved latest.pt"
 
                 tqdm.write(f"{tag} step {step:,} │ val_loss {val_txt} │ {ansi.dim(saved_txt)}")
+
+                if (
+                    train_cfg.early_stop_patience > 0
+                    and step >= train_cfg.early_stop_min_steps
+                    and no_improve_evals >= train_cfg.early_stop_patience
+                ):
+                    tqdm.write(
+                        ansi.yellow(
+                            f"  ■ EARLY STOP at step {step:,}: no val_loss improvement "
+                            f"(>{train_cfg.early_stop_min_delta:.1e}) for {no_improve_evals} consecutive checks."
+                        )
+                    )
+                    break
 
             if step % train_cfg.save_every == 0:
                 milestone_path = ckpt_dir / f"step_{step}.pt"
@@ -748,6 +776,18 @@ def main() -> None:
     parser.add_argument("--discrete-bits", type=int, default=8, help="Binary bits per coordinate for discrete branch")
     parser.add_argument("--discrete-train-t", type=int, default=20, help="Train discrete branch on t < this value")
     parser.add_argument("--discrete-sample-t", type=int, default=32, help="Use discrete branch in sampling on t < this value")
+    parser.add_argument(
+        "--early-stop-patience",
+        type=int,
+        default=0,
+        help="Optional early stopping: stop after N val checks without improvement (0 = disabled, e.g. 25 = 50k steps)",
+    )
+    parser.add_argument(
+        "--early-stop-min-steps",
+        type=int,
+        default=50_000,
+        help="Minimum steps before early stopping can trigger (lets EMA and discrete branch converge)",
+    )
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--smoke-test", action="store_true", help="Fast CPU smoke test on 32 plans for 5 steps")
@@ -817,6 +857,8 @@ def main() -> None:
         compile_model=args.compile,
         bucket_batching=not args.no_bucket_batching,
         num_workers=args.num_workers,
+        early_stop_patience=args.early_stop_patience,
+        early_stop_min_steps=args.early_stop_min_steps,
         checkpoint_dir=args.checkpoint_dir,
         seed=args.seed,
     )
