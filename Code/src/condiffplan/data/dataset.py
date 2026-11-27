@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 
 from condiffplan.config import (
     DEFAULT_CORNER_COUNTS,
@@ -400,8 +400,93 @@ def apply_dihedral_transform(
     return pts, corner_idx, next_corner_idx
 
 
+class BucketBatchSampler(Sampler[List[int]]):
+    """Randomized length-bucketed batch sampler to eliminate O(M^2) padding waste.
+
+    Groups samples of similar corner counts M within randomized megabatches, then shuffles
+    batch order every epoch so every sample is visited once per epoch with minimal padding.
+    """
+
+    def __init__(
+        self,
+        lengths: Sequence[int],
+        batch_size: int,
+        drop_last: bool = True,
+        pool_multiplier: int = 16,
+        seed: int = 42,
+    ) -> None:
+        self.lengths = np.asarray(lengths, dtype=np.int64)
+        self.batch_size = max(int(batch_size), 1)
+        self.drop_last = bool(drop_last)
+        self.pool_size = max(self.batch_size * max(int(pool_multiplier), 1), self.batch_size)
+        self.seed = int(seed)
+        self._epoch = 0
+
+    def __len__(self) -> int:
+        n = len(self.lengths)
+        if self.drop_last:
+            return n // self.batch_size
+        return (n + self.batch_size - 1) // self.batch_size
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed + self._epoch)
+        self._epoch += 1
+
+        n = len(self.lengths)
+        order = rng.permutation(n)
+
+        batches: List[List[int]] = []
+        for pool_start in range(0, n, self.pool_size):
+            pool = order[pool_start : pool_start + self.pool_size]
+            # Sort within the randomized pool by sequence length
+            pool_sorted = pool[np.argsort(self.lengths[pool], kind="mergesort")]
+            for b_start in range(0, len(pool_sorted), self.batch_size):
+                chunk = pool_sorted[b_start : b_start + self.batch_size]
+                if len(chunk) == self.batch_size or not self.drop_last:
+                    batches.append(chunk.tolist())
+
+        # Shuffle the order of batches across the epoch
+        batch_perm = rng.permutation(len(batches))
+        for idx in batch_perm:
+            yield batches[int(idx)]
+
+
+def materialize_attention_masks_gpu(
+    batch: Dict[str, torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return (room_mask, rel_mask, rel_edge_type), building them on-device from compact element
+    adjacency matrices when not already materialized on CPU.
+    """
+    if "room_mask" in batch and "rel_mask" in batch and "rel_edge_type" in batch:
+        return batch["room_mask"], batch["rel_mask"], batch["rel_edge_type"]
+
+    elem_idx = batch["elem_idx"]          # [B, M] long
+    padding_mask = batch["padding_mask"]  # [B, M] bool
+    elem_adj = batch["elem_adj"]          # [B, K, K] bool
+    elem_etype = batch["elem_etype"]      # [B, K, K] uint8
+
+    bsz, seqlen = elem_idx.shape
+    device = elem_idx.device
+
+    e_i = elem_idx.unsqueeze(2)  # [B, M, 1]
+    e_j = elem_idx.unsqueeze(1)  # [B, 1, M]
+    valid_pair = padding_mask.unsqueeze(2) & padding_mask.unsqueeze(1)
+    diag = torch.eye(seqlen, device=device, dtype=torch.bool).unsqueeze(0)
+
+    room_mask = ((e_i == e_j) & valid_pair) | diag
+    b_idx = torch.arange(bsz, device=device).view(bsz, 1, 1)
+    rel_mask = (elem_adj[b_idx, e_i, e_j] & valid_pair) | diag
+    zero = torch.zeros((), device=device, dtype=elem_etype.dtype)
+    rel_edge_type = torch.where(valid_pair, elem_etype[b_idx, e_i, e_j], zero)
+    return room_mask, rel_mask, rel_edge_type
+
+
 class ResPlanDiffusionDataset(Dataset):
-    """PyTorch Dataset yielding tokenized floorplans with heuristic conditional masking."""
+    """PyTorch Dataset yielding tokenized floorplans with heuristic conditional masking.
+
+    Pre-expands static graph structures once in __init__ so __getitem__ only performs fast
+    dihedral augmentation and conditional masking with zero redundant graph traversal.
+    """
 
     def __init__(
         self,
@@ -409,44 +494,76 @@ class ResPlanDiffusionDataset(Dataset):
         cfg: Optional[DataConfig] = None,
         is_train: bool = True,
         include_metadata: bool = True,
+        compact_masks: Optional[bool] = None,
     ) -> None:
         super().__init__()
         self.cfg = cfg or DataConfig()
         self.is_train = is_train
         self.include_metadata = include_metadata
+        # By default, use compact element-level masks during training/val (include_metadata=False)
+        # to avoid O(M^2) CPU allocations and PCIe transfers; materialize on GPU in microseconds.
+        self.compact_masks = (not include_metadata) if compact_masks is None else bool(compact_masks)
 
         if isinstance(graphs_or_cache_path, (str, Path)):
             raw_list = torch.load(graphs_or_cache_path, weights_only=False)
         else:
             raw_list = list(graphs_or_cache_path)
 
-        self.graphs: List[FloorplanGraph] = [
-            g if isinstance(g, FloorplanGraph) else FloorplanGraph.from_dict(g)
-            for g in raw_list
-        ]
+        self._records: List[Dict[str, Any]] = []
+        self.lengths: List[int] = []
+
+        for g_raw in raw_list:
+            g = g_raw if isinstance(g_raw, FloorplanGraph) else FloorplanGraph.from_dict(g_raw)
+            expanded = expand_graph_to_tokens(
+                g,
+                max_elements=self.cfg.max_elements,
+                max_corners=self.cfg.max_corners_per_elem,
+            )
+            manifest: List[ElementManifestItem] = expanded["manifest"]
+            num_elems = len(manifest)
+            elem_adj = np.zeros((num_elems, num_elems), dtype=bool)
+            elem_etype = np.zeros((num_elems, num_elems), dtype=np.uint8)
+            edge_index = expanded["edge_index"]
+            edge_type = expanded["edge_type"]
+            if edge_index.shape[1] > 0:
+                u, v = edge_index[0], edge_index[1]
+                elem_adj[u, v] = True
+                elem_etype[u, v] = edge_type.astype(np.uint8)
+
+            rec: Dict[str, Any] = {
+                "coords": expanded["coords"],
+                "elem_type": expanded["elem_type"],
+                "elem_idx": expanded["elem_idx"],
+                "corner_idx": expanded["corner_idx"],
+                "next_corner_idx": expanded["next_corner_idx"],
+                "norm_area": expanded["norm_area"],
+                "has_area": expanded["has_area"],
+                "elem_adj": elem_adj,
+                "elem_etype": elem_etype,
+                "manifest": manifest,
+                "room_items": [it for it in manifest if it.category == "room"],
+                "bnd_items": [it for it in manifest if it.category == "boundary"],
+                "opening_items": [it for it in manifest if it.category == "opening" and it.connected_rooms],
+            }
+            if include_metadata:
+                rec["graph"] = expanded["graph"]
+            self._records.append(rec)
+            self.lengths.append(int(expanded["coords"].shape[0]))
         del raw_list
 
     def __len__(self) -> int:
-        return len(self.graphs)
+        return len(self._records)
 
     def __getitem__(self, index: int) -> Dict[str, Any]:
-        base_graph = self.graphs[index]
-        expanded = expand_graph_to_tokens(
-            base_graph,
-            max_elements=self.cfg.max_elements,
-            max_corners=self.cfg.max_corners_per_elem,
-        )
-
-        coords = expanded["coords"]
-        elem_type = expanded["elem_type"]
-        elem_idx = expanded["elem_idx"]
-        corner_idx = expanded["corner_idx"]
-        next_corner_idx = expanded["next_corner_idx"]
-        norm_area = expanded["norm_area"].copy()
-        has_area = expanded["has_area"].copy()
-        edge_index = expanded["edge_index"]
-        edge_type = expanded["edge_type"]
-        manifest: List[ElementManifestItem] = expanded["manifest"]
+        rec = self._records[index]
+        coords = rec["coords"]
+        elem_type = rec["elem_type"]
+        elem_idx = rec["elem_idx"]
+        corner_idx = rec["corner_idx"]
+        next_corner_idx = rec["next_corner_idx"]
+        norm_area = rec["norm_area"].copy()
+        has_area = rec["has_area"].copy()
+        manifest: List[ElementManifestItem] = rec["manifest"]
 
         rng = np.random.default_rng()
 
@@ -469,7 +586,7 @@ class ResPlanDiffusionDataset(Dataset):
             fix_rooms = False
             keep_area = True
 
-        room_items = [it for it in manifest if it.category == "room"]
+        room_items: List[ElementManifestItem] = rec["room_items"]
         fixed_room_ids = set()
         if fix_rooms and len(room_items) > 1:
             num_to_fix = int(rng.integers(1, len(room_items)))
@@ -479,10 +596,12 @@ class ResPlanDiffusionDataset(Dataset):
                 fixed_mask[it.start_token : it.end_token] = True
                 fixed_room_ids.add(it.id)
 
-        for it in manifest:
-            if it.category == "boundary" and fix_bnd:
+        if fix_bnd:
+            for it in rec["bnd_items"]:
                 fixed_mask[it.start_token : it.end_token] = True
-            elif it.category == "opening" and it.connected_rooms:
+
+        if fixed_room_ids:
+            for it in rec["opening_items"]:
                 if all(rid in fixed_room_ids for rid in it.connected_rooms):
                     fixed_mask[it.start_token : it.end_token] = True
 
@@ -497,13 +616,6 @@ class ResPlanDiffusionDataset(Dataset):
             norm_area[unfixed] = 0.0
             has_area[unfixed] = False
 
-        room_mask, rel_mask, rel_edge_type = build_attention_masks(
-            elem_idx=elem_idx,
-            edge_index=edge_index,
-            edge_type=edge_type,
-            num_elements=len(manifest),
-        )
-
         sample: Dict[str, Any] = {
             "coords": torch.from_numpy(coords),
             "elem_type": torch.from_numpy(elem_type),
@@ -513,20 +625,36 @@ class ResPlanDiffusionDataset(Dataset):
             "fixed_mask": torch.from_numpy(fixed_mask),
             "norm_area": torch.from_numpy(norm_area),
             "has_area": torch.from_numpy(has_area),
-            "room_mask": torch.from_numpy(room_mask),
-            "rel_mask": torch.from_numpy(rel_mask),
-            "rel_edge_type": torch.from_numpy(rel_edge_type),
         }
+
+        if self.compact_masks:
+            sample["elem_adj"] = torch.from_numpy(rec["elem_adj"])
+            sample["elem_etype"] = torch.from_numpy(rec["elem_etype"])
+        else:
+            elem_adj = rec["elem_adj"]
+            elem_etype = rec["elem_etype"]
+            room_mask = elem_idx[:, None] == elem_idx[None, :]
+            rel_mask = elem_adj[elem_idx[:, None], elem_idx[None, :]]
+            np.fill_diagonal(rel_mask, True)
+            rel_edge_type = elem_etype[elem_idx[:, None], elem_idx[None, :]].astype(np.int64)
+            sample["room_mask"] = torch.from_numpy(room_mask)
+            sample["rel_mask"] = torch.from_numpy(rel_mask)
+            sample["rel_edge_type"] = torch.from_numpy(rel_edge_type)
+
         if self.include_metadata:
             sample["manifest"] = manifest
-            sample["graph"] = expanded["graph"]
+            sample["graph"] = rec["graph"]
         return sample
 
 
-def collate_floorplans(batch: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
-    """Pad variable-length floorplan token sequences to the maximum token count in the batch."""
+def collate_floorplans(batch: Sequence[Dict[str, Any]], pad_to_multiple: int = 8) -> Dict[str, Any]:
+    """Pad variable-length floorplan token sequences to a Tensor-Core-aligned multiple."""
     bsz = len(batch)
-    max_m = max(int(item["coords"].shape[0]) for item in batch)
+    raw_max_m = max(int(item["coords"].shape[0]) for item in batch)
+    if pad_to_multiple > 1:
+        max_m = ((raw_max_m + pad_to_multiple - 1) // pad_to_multiple) * pad_to_multiple
+    else:
+        max_m = raw_max_m
 
     coords = torch.zeros((bsz, max_m, 2), dtype=torch.float32)
     elem_type = torch.zeros((bsz, max_m), dtype=torch.long)
@@ -538,14 +666,19 @@ def collate_floorplans(batch: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     has_area = torch.zeros((bsz, max_m), dtype=torch.bool)
     padding_mask = torch.zeros((bsz, max_m), dtype=torch.bool)
 
-    room_mask = torch.zeros((bsz, max_m, max_m), dtype=torch.bool)
-    rel_mask = torch.zeros((bsz, max_m, max_m), dtype=torch.bool)
-    rel_edge_type = torch.zeros((bsz, max_m, max_m), dtype=torch.long)
-
-    # Diagonal self-attention enabled everywhere to avoid NaN in softmax on padded rows
-    diag_idx = torch.arange(max_m)
-    room_mask[:, diag_idx, diag_idx] = True
-    rel_mask[:, diag_idx, diag_idx] = True
+    use_compact = ("elem_adj" in batch[0]) and ("room_mask" not in batch[0])
+    if use_compact:
+        max_k = max(int(item["elem_adj"].shape[0]) for item in batch)
+        elem_adj = torch.zeros((bsz, max_k, max_k), dtype=torch.bool)
+        elem_etype = torch.zeros((bsz, max_k, max_k), dtype=torch.uint8)
+    else:
+        room_mask = torch.zeros((bsz, max_m, max_m), dtype=torch.bool)
+        rel_mask = torch.zeros((bsz, max_m, max_m), dtype=torch.bool)
+        rel_edge_type = torch.zeros((bsz, max_m, max_m), dtype=torch.long)
+        # Diagonal self-attention enabled everywhere to avoid NaN in softmax on padded rows
+        diag_idx = torch.arange(max_m)
+        room_mask[:, diag_idx, diag_idx] = True
+        rel_mask[:, diag_idx, diag_idx] = True
 
     has_meta = "manifest" in batch[0] and "graph" in batch[0]
     manifests: List[List[ElementManifestItem]] = []
@@ -566,9 +699,14 @@ def collate_floorplans(batch: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         has_area[i, :m] = item["has_area"]
         padding_mask[i, :m] = True
 
-        room_mask[i, :m, :m] = item["room_mask"]
-        rel_mask[i, :m, :m] = item["rel_mask"]
-        rel_edge_type[i, :m, :m] = item["rel_edge_type"]
+        if use_compact:
+            k = int(item["elem_adj"].shape[0])
+            elem_adj[i, :k, :k] = item["elem_adj"]
+            elem_etype[i, :k, :k] = item["elem_etype"]
+        else:
+            room_mask[i, :m, :m] = item["room_mask"]
+            rel_mask[i, :m, :m] = item["rel_mask"]
+            rel_edge_type[i, :m, :m] = item["rel_edge_type"]
 
         if has_meta:
             manifests.append(item["manifest"])
@@ -584,10 +722,15 @@ def collate_floorplans(batch: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         "norm_area": norm_area,
         "has_area": has_area,
         "padding_mask": padding_mask,
-        "room_mask": room_mask,
-        "rel_mask": rel_mask,
-        "rel_edge_type": rel_edge_type,
     }
+    if use_compact:
+        out["elem_adj"] = elem_adj
+        out["elem_etype"] = elem_etype
+    else:
+        out["room_mask"] = room_mask
+        out["rel_mask"] = rel_mask
+        out["rel_edge_type"] = rel_edge_type
+
     if has_meta:
         out["manifests"] = manifests
         out["graphs"] = graphs

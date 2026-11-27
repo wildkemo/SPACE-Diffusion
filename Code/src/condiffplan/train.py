@@ -22,8 +22,9 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from condiffplan.config import DataConfig, DiffusionConfig, ModelConfig, TrainConfig
-from condiffplan.data.dataset import ResPlanDiffusionDataset, collate_floorplans
+from condiffplan.data.dataset import BucketBatchSampler, ResPlanDiffusionDataset, collate_floorplans
 from condiffplan.data.preprocess import preprocess_resplan_splits
+from condiffplan.hardware import HardwareProfile, configure_hardware, is_oom_error
 from condiffplan.model.diffusion import ConditionalGaussianDiffusion
 from condiffplan.model.transformer import ConDiffPlanTransformer
 from condiffplan.pipeline import resolve_device
@@ -115,8 +116,7 @@ def _vram_usage_str(device: torch.device) -> str:
 
 def _print_banner(
     ansi: _Ansi,
-    device: torch.device,
-    use_amp: bool,
+    hw: HardwareProfile,
     model_cfg: ModelConfig,
     diff_cfg: DiffusionConfig,
     train_cfg: TrainConfig,
@@ -127,14 +127,30 @@ def _print_banner(
     resume_path: Optional[str],
 ) -> None:
     title = " ConDiffPlan · Vector Floorplan Diffusion Training "
+    batch_str = (
+        f"{train_cfg.batch_size}"
+        if hw.grad_accum_steps <= 1
+        else f"{train_cfg.batch_size} (micro {hw.micro_batch_size} × {hw.grad_accum_steps} accum)"
+    )
+    disc_str = (
+        f"Discrete: {model_cfg.discrete_n_layers}L/{model_cfg.discrete_num_bits}b "
+        f"(train t<{diff_cfg.discrete_train_t}, sample t<{diff_cfg.discrete_sample_t})"
+        if model_cfg.enable_discrete
+        else "Discrete: off"
+    )
+    bucket_str = " · bucketed" if train_cfg.bucket_batching else ""
     rows = [
-        ("Hardware", f"{_device_summary(device)}  |  Precision: {'AMP (FP16)' if use_amp else 'FP32'}"),
+        ("Hardware", f"{hw.summary_str}  |  Precision: {hw.precision_label}"),
         (
             "Model",
             f"{model_cfg.n_layers}L × {model_cfg.d_model}d × {model_cfg.n_heads}H "
             f"({_format_params(num_params)} params)  |  T={diff_cfg.num_timesteps} ({diff_cfg.schedule})",
         ),
-        ("Dataset", f"Train: {train_size:,} plans  |  Val: {val_size:,} plans  |  Batch: {train_cfg.batch_size}"),
+        ("Denoising", f"Continuous + {disc_str}"),
+        (
+            "Dataset",
+            f"Train: {train_size:,} plans  |  Val: {val_size:,} plans  |  Batch: {batch_str}{bucket_str}  |  Workers: {hw.num_workers}",
+        ),
         (
             "Schedule",
             f"Steps: {start_step:,} → {train_cfg.total_steps:,}  |  "
@@ -244,7 +260,7 @@ class _AsyncCheckpointSaver:
 
 
 class EMA:
-    """Exponential Moving Average of model parameters for higher sampling stability."""
+    """Exponential Moving Average of model parameters using 1-kernel _foreach_lerp_."""
 
     def __init__(self, model: nn.Module, decay: float = 0.9999) -> None:
         self.decay = float(decay)
@@ -252,13 +268,20 @@ class EMA:
         self.shadow.eval()
         for p in self.shadow.parameters():
             p.requires_grad_(False)
+        self._shadow_params = [p.data for p in self.shadow.parameters()]
+        self._shadow_buffers = [b.data for b in self.shadow.buffers()]
 
     @torch.no_grad()
     def update(self, model: nn.Module) -> None:
-        for s_param, m_param in zip(self.shadow.parameters(), model.parameters()):
-            s_param.data.mul_(self.decay).add_(m_param.data, alpha=1.0 - self.decay)
-        for s_buf, m_buf in zip(self.shadow.buffers(), model.buffers()):
-            s_buf.data.copy_(m_buf.data)
+        model_params = [p.data for p in model.parameters()]
+        if self._shadow_params:
+            if hasattr(torch, "_foreach_lerp_"):
+                torch._foreach_lerp_(self._shadow_params, model_params, 1.0 - self.decay)
+            else:
+                for s_p, m_p in zip(self._shadow_params, model_params):
+                    s_p.mul_(self.decay).add_(m_p, alpha=1.0 - self.decay)
+        for s_buf, m_buf in zip(self._shadow_buffers, model.buffers()):
+            s_buf.copy_(m_buf.data)
 
 
 def set_seed(seed: int) -> None:
@@ -290,28 +313,17 @@ def evaluate_validation_loss(
     val_loader: DataLoader,
     device: torch.device,
     max_batches: int = 25,
+    amp_dtype: Optional[torch.dtype] = None,
+    use_amp: bool = False,
 ) -> float:
     model.eval()
     losses = []
-    tensor_keys = [
-        "coords",
-        "elem_type",
-        "elem_idx",
-        "corner_idx",
-        "next_corner_idx",
-        "fixed_mask",
-        "norm_area",
-        "has_area",
-        "padding_mask",
-        "room_mask",
-        "rel_mask",
-        "rel_edge_type",
-    ]
     for i, batch in enumerate(val_loader):
         if i >= max_batches:
             break
-        dev_batch = {k: batch[k].to(device) for k in tensor_keys}
-        loss = diffusion.training_loss(model, dev_batch)
+        dev_batch = {k: v.to(device, non_blocking=True) for k, v in batch.items() if torch.is_tensor(v)}
+        with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
+            loss = diffusion.training_loss(model, dev_batch)
         losses.append(float(loss.item()))
     model.train()
     return float(np.mean(losses)) if losses else 0.0
@@ -356,20 +368,37 @@ def run_training(
         val_pt, cfg=data_cfg, is_train=False, include_metadata=False
     )
 
-    # On Windows (spawn), multi-worker DataLoaders reload the entire dataset per worker
-    # and can thrash HDD/RAM; default to 0 there unless overridden.
-    effective_workers = train_cfg.num_workers if device.type == "cuda" else 0
-    if os.name == "nt" and train_cfg.num_workers == TrainConfig.num_workers:
-        effective_workers = 0
+    hw = configure_hardware(
+        device=device,
+        batch_size=min(train_cfg.batch_size, len(train_dataset)),
+        precision=train_cfg.precision,
+        micro_batch_size=train_cfg.micro_batch_size,
+        num_workers=train_cfg.num_workers,
+        amp_enabled=train_cfg.amp,
+    )
+    if train_cfg.grad_checkpointing:
+        model_cfg.grad_checkpointing = True
+
+    effective_workers = hw.num_workers
+    eff_bsz = min(train_cfg.batch_size, len(train_dataset))
+    drop_last = len(train_dataset) >= train_cfg.batch_size
 
     loader_kwargs: Dict[str, Any] = {
-        "batch_size": min(train_cfg.batch_size, len(train_dataset)),
-        "shuffle": True,
         "num_workers": effective_workers,
         "collate_fn": collate_floorplans,
         "pin_memory": (device.type == "cuda"),
-        "drop_last": (len(train_dataset) >= train_cfg.batch_size),
     }
+    if train_cfg.bucket_batching and len(train_dataset) > 0:
+        loader_kwargs["batch_sampler"] = BucketBatchSampler(
+            lengths=train_dataset.lengths,
+            batch_size=eff_bsz,
+            drop_last=drop_last,
+            seed=train_cfg.seed,
+        )
+    else:
+        loader_kwargs["batch_size"] = eff_bsz
+        loader_kwargs["shuffle"] = True
+        loader_kwargs["drop_last"] = drop_last
     if effective_workers > 0:
         loader_kwargs["persistent_workers"] = True
         loader_kwargs["prefetch_factor"] = 2
@@ -377,24 +406,32 @@ def run_training(
     train_loader = DataLoader(train_dataset, **loader_kwargs)
     val_loader = DataLoader(
         val_dataset,
-        batch_size=min(train_cfg.batch_size, len(val_dataset)),
+        batch_size=min(hw.micro_batch_size, len(val_dataset)),
         shuffle=False,
         num_workers=0,
         collate_fn=collate_floorplans,
+        pin_memory=(device.type == "cuda"),
     )
 
-    model = ConDiffPlanTransformer(model_cfg).to(device)
+    raw_model = ConDiffPlanTransformer(model_cfg).to(device)
     diffusion = ConditionalGaussianDiffusion(diff_cfg).to(device)
-    ema = EMA(model, decay=train_cfg.ema_decay)
+    ema = EMA(raw_model, decay=train_cfg.ema_decay)
 
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=train_cfg.lr,
-        weight_decay=train_cfg.weight_decay,
-    )
+    try:
+        optimizer = torch.optim.Adam(
+            raw_model.parameters(),
+            lr=train_cfg.lr,
+            weight_decay=train_cfg.weight_decay,
+            fused=(device.type == "cuda"),
+        )
+    except (TypeError, RuntimeError):
+        optimizer = torch.optim.Adam(
+            raw_model.parameters(),
+            lr=train_cfg.lr,
+            weight_decay=train_cfg.weight_decay,
+        )
 
-    use_amp = bool(train_cfg.amp and device.type == "cuda")
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    scaler = torch.amp.GradScaler("cuda", enabled=hw.use_grad_scaler)
 
     start_step = 0
     best_val_loss = float("inf")
@@ -402,13 +439,35 @@ def run_training(
     if resume_path is not None and Path(resume_path).exists():
         print(f"Resuming checkpoint from {resume_path}...", flush=True)
         ckpt = torch.load(resume_path, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model_state_dict"])
+        missing, unexpected = raw_model.load_state_dict(ckpt["model_state_dict"], strict=False)
+        if missing:
+            print(
+                f"  [resume] Freshly initialized {len(missing)} new parameter(s) "
+                f"(e.g., {missing[0]}).",
+                flush=True,
+            )
+        if unexpected:
+            print(
+                f"  [resume] Ignored {len(unexpected)} unexpected key(s) from checkpoint.",
+                flush=True,
+            )
         if "ema_state_dict" in ckpt:
-            ema.shadow.load_state_dict(ckpt["ema_state_dict"])
-        if "optimizer_state_dict" in ckpt:
-            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            ema.shadow.load_state_dict(ckpt["ema_state_dict"], strict=False)
+            if missing:
+                # Sync freshly initialized parameters into EMA shadow
+                ema.shadow.load_state_dict(raw_model.state_dict(), strict=True)
+        if "optimizer_state_dict" in ckpt and not missing and not unexpected:
+            try:
+                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            except ValueError:
+                print("  [resume] Optimizer state incompatible with current model; starting fresh optimizer.", flush=True)
         start_step = int(ckpt.get("step", 0))
         best_val_loss = float(ckpt.get("best_val_loss", float("inf")))
+
+    model: nn.Module = raw_model
+    if train_cfg.compile_model and hasattr(torch, "compile"):
+        print("Compiling model with torch.compile(dynamic=True)...", flush=True)
+        model = torch.compile(raw_model, dynamic=True)  # type: ignore[assignment]
 
     ckpt_dir = Path(train_cfg.checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -426,7 +485,7 @@ def run_training(
             "step": step,
             "best_val_loss": best_val_loss,
             "val_loss": val_loss,
-            "model_state_dict": model.state_dict(),
+            "model_state_dict": raw_model.state_dict(),
             "ema_state_dict": ema.shadow.state_dict(),
             "model_config": model_cfg.to_dict(),
             "diffusion_config": diff_cfg.to_dict(),
@@ -438,31 +497,15 @@ def run_training(
             payload["optimizer_state_dict"] = optimizer.state_dict()
         ckpt_saver.save(path, payload)
 
-    tensor_keys = [
-        "coords",
-        "elem_type",
-        "elem_idx",
-        "corner_idx",
-        "next_corner_idx",
-        "fixed_mask",
-        "norm_area",
-        "has_area",
-        "padding_mask",
-        "room_mask",
-        "rel_mask",
-        "rel_edge_type",
-    ]
-
     model.train()
     data_iter = infinite_loader(train_loader)
     ansi = _Ansi()
     show_vram = device.type == "cuda"
-    num_params = sum(p.numel() for p in model.parameters())
+    num_params = sum(p.numel() for p in raw_model.parameters())
 
     _print_banner(
         ansi=ansi,
-        device=device,
-        use_amp=use_amp,
+        hw=hw,
         model_cfg=model_cfg,
         diff_cfg=diff_cfg,
         train_cfg=train_cfg,
@@ -477,10 +520,12 @@ def run_training(
     t0 = time.time()
     interval_t0 = t0
     interval_steps = 0
-    running_loss = 0.0
-    running_grad_norm = 0.0
+    # Accumulate metrics on-device to avoid per-step CPU-GPU sync stalls
+    running_loss_t = torch.zeros((), device=device, dtype=torch.float32)
+    running_grad_t = torch.zeros((), device=device, dtype=torch.float32)
     running_count = 0
     total_steps = train_cfg.total_steps
+    current_micro_bsz = hw.micro_batch_size
 
     pbar = tqdm(
         range(start_step + 1, total_steps + 1),
@@ -500,41 +545,85 @@ def run_training(
                 pg["lr"] = lr_now
 
             batch = next(data_iter)
-            dev_batch = {k: batch[k].to(device, non_blocking=True) for k in tensor_keys}
+            logical_bsz = int(batch["coords"].shape[0])
 
-            optimizer.zero_grad(set_to_none=True)
-            with torch.amp.autocast("cuda", enabled=use_amp):
-                loss = diffusion.training_loss(model, dev_batch)
+            # Micro-batched forward/backward with automatic CUDA OOM recovery (zero per-step syncs)
+            while True:
+                optimizer.zero_grad(set_to_none=True)
+                step_loss_t = torch.zeros((), device=device, dtype=torch.float32)
+                try:
+                    if current_micro_bsz >= logical_bsz:
+                        dev_batch = {
+                            k: v.to(device, non_blocking=True)
+                            for k, v in batch.items()
+                            if torch.is_tensor(v)
+                        }
+                        with torch.amp.autocast("cuda", dtype=hw.amp_dtype, enabled=hw.use_amp):
+                            loss = diffusion.training_loss(model, dev_batch)
+                        scaler.scale(loss).backward()
+                        step_loss_t = loss.detach().float()
+                    else:
+                        for start in range(0, logical_bsz, current_micro_bsz):
+                            end = min(start + current_micro_bsz, logical_bsz)
+                            chunk_weight = float(end - start) / float(logical_bsz)
+                            dev_chunk = {
+                                k: v[start:end].to(device, non_blocking=True)
+                                for k, v in batch.items()
+                                if torch.is_tensor(v)
+                            }
+                            with torch.amp.autocast("cuda", dtype=hw.amp_dtype, enabled=hw.use_amp):
+                                chunk_loss = diffusion.training_loss(model, dev_chunk)
+                            scaler.scale(chunk_loss * chunk_weight).backward()
+                            step_loss_t = step_loss_t + chunk_loss.detach().float() * chunk_weight
+                    break
+                except BaseException as exc:
+                    if device.type == "cuda" and is_oom_error(exc) and current_micro_bsz > 1:
+                        optimizer.zero_grad(set_to_none=True)
+                        torch.cuda.empty_cache()
+                        new_micro = max(1, current_micro_bsz // 2)
+                        tqdm.write(
+                            ansi.yellow(
+                                f"  ! CUDA OOM at step {step:,} with micro_batch_size={current_micro_bsz}; "
+                                f"retrying with micro_batch_size={new_micro} (effective batch={logical_bsz})"
+                            )
+                        )
+                        current_micro_bsz = new_micro
+                        continue
+                    raise
 
-            if not torch.isfinite(loss):
-                raise RuntimeError(f"Non-finite training loss encountered at step {step}: {loss.item()}")
-
-            scaler.scale(loss).backward()
-            grad_norm_val = 0.0
             if train_cfg.grad_clip > 0:
-                scaler.unscale_(optimizer)
-                gn = torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.grad_clip)
-                grad_norm_val = float(gn.item()) if torch.is_tensor(gn) else float(gn)
-            scaler.step(optimizer)
-            scaler.update()
+                if hw.use_grad_scaler:
+                    scaler.unscale_(optimizer)
+                gn = torch.nn.utils.clip_grad_norm_(raw_model.parameters(), train_cfg.grad_clip)
+                if torch.is_tensor(gn):
+                    running_grad_t = running_grad_t + gn.detach().float()
+                else:
+                    running_grad_t = running_grad_t + float(gn)
 
-            ema.update(model)
+            if hw.use_grad_scaler:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
 
-            loss_val = float(loss.item())
-            running_loss += loss_val
-            running_grad_norm += grad_norm_val
+            ema.update(raw_model)
+
+            running_loss_t = running_loss_t + step_loss_t
             running_count += 1
             interval_steps += 1
 
-            postfix: Dict[str, str] = {"loss": f"{loss_val:.4f}", "lr": f"{lr_now:.1e}"}
-            if show_vram:
-                postfix["vram"] = _vram_usage_str(device)
-            pbar.set_postfix(postfix, refresh=False)
-
             if step % train_cfg.log_every == 0 or step == start_step + 1 or step == total_steps:
                 now = time.time()
-                avg_loss = running_loss / max(running_count, 1)
-                avg_grad = running_grad_norm / max(running_count, 1)
+                avg_loss = float(running_loss_t.item()) / max(running_count, 1)
+                if not math.isfinite(avg_loss):
+                    raise RuntimeError(f"Non-finite training loss encountered at step {step}: {avg_loss}")
+                avg_grad = float(running_grad_t.item()) / max(running_count, 1)
+
+                postfix: Dict[str, str] = {"loss": f"{avg_loss:.4f}", "lr": f"{lr_now:.1e}"}
+                if show_vram:
+                    postfix["vram"] = _vram_usage_str(device)
+                pbar.set_postfix(postfix, refresh=False)
+
                 elapsed = now - t0
                 steps_done = step - start_step
                 interval_dt = max(now - interval_t0, 1e-6)
@@ -560,14 +649,21 @@ def run_training(
                 ])
                 tqdm.write(" │ ".join(row_cols))
 
-                running_loss = 0.0
-                running_grad_norm = 0.0
+                running_loss_t.zero_()
+                running_grad_t.zero_()
                 running_count = 0
                 interval_t0 = now
                 interval_steps = 0
 
             if step % train_cfg.val_every == 0 or step == total_steps:
-                val_loss = evaluate_validation_loss(ema.shadow, diffusion, val_loader, device)
+                val_loss = evaluate_validation_loss(
+                    ema.shadow,
+                    diffusion,
+                    val_loader,
+                    device,
+                    amp_dtype=hw.amp_dtype,
+                    use_amp=hw.use_amp,
+                )
                 prev_best = best_val_loss
                 is_best = val_loss <= best_val_loss
                 if is_best:
@@ -637,7 +733,21 @@ def main() -> None:
     parser.add_argument("--lr-min", type=float, default=1e-6)
     parser.add_argument("--timesteps", type=int, default=1000)
     parser.add_argument("--device", type=str, default="auto")
-    parser.add_argument("--num-workers", type=int, default=0 if os.name == "nt" else 2)
+    parser.add_argument("--precision", type=str, default="auto", choices=["auto", "bf16", "fp16", "fp32"])
+    parser.add_argument(
+        "--micro-batch-size",
+        type=int,
+        default=None,
+        help="Optional micro-batch size for gradient accumulation (default: auto from GPU VRAM)",
+    )
+    parser.add_argument("--grad-checkpointing", action="store_true", help="Enable activation checkpointing for low-VRAM GPUs")
+    parser.add_argument("--compile", action="store_true", help="Enable torch.compile(dynamic=True) on the model")
+    parser.add_argument("--no-bucket-batching", action="store_true", help="Disable length-bucketed batching")
+    parser.add_argument("--num-workers", type=int, default=-1, help="DataLoader workers (-1 = auto)")
+    parser.add_argument("--no-discrete", action="store_true", help="Disable HouseDiffusion discrete denoising branch")
+    parser.add_argument("--discrete-bits", type=int, default=8, help="Binary bits per coordinate for discrete branch")
+    parser.add_argument("--discrete-train-t", type=int, default=20, help="Train discrete branch on t < this value")
+    parser.add_argument("--discrete-sample-t", type=int, default=32, help="Use discrete branch in sampling on t < this value")
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--smoke-test", action="store_true", help="Fast CPU smoke test on 32 plans for 5 steps")
@@ -650,7 +760,13 @@ def main() -> None:
             cache_dir=args.cache_dir,
         )
         model_cfg = ModelConfig.preset("tiny")
-        diff_cfg = DiffusionConfig(num_timesteps=20)
+        model_cfg.enable_discrete = not args.no_discrete
+        model_cfg.discrete_num_bits = args.discrete_bits
+        diff_cfg = DiffusionConfig(
+            num_timesteps=20,
+            discrete_train_t=min(args.discrete_train_t, 20),
+            discrete_sample_t=min(args.discrete_sample_t, 20),
+        )
         train_cfg = TrainConfig(
             batch_size=8,
             lr=1e-3,
@@ -662,6 +778,7 @@ def main() -> None:
             checkpoint_dir=args.checkpoint_dir,
             seed=args.seed,
             amp=False,
+            precision="fp32",
         )
         ckpt_path = run_training(
             data_cfg=data_cfg,
@@ -681,12 +798,24 @@ def main() -> None:
         cache_dir=args.cache_dir,
     )
     model_cfg = ModelConfig.preset(args.preset)
-    diff_cfg = DiffusionConfig(num_timesteps=args.timesteps)
+    model_cfg.enable_discrete = not args.no_discrete
+    model_cfg.discrete_num_bits = args.discrete_bits
+    model_cfg.grad_checkpointing = args.grad_checkpointing
+    diff_cfg = DiffusionConfig(
+        num_timesteps=args.timesteps,
+        discrete_train_t=args.discrete_train_t,
+        discrete_sample_t=args.discrete_sample_t,
+    )
     train_cfg = TrainConfig(
         batch_size=args.batch_size,
         lr=args.lr,
         lr_min=args.lr_min,
         total_steps=args.steps,
+        precision=args.precision,
+        micro_batch_size=args.micro_batch_size,
+        grad_checkpointing=args.grad_checkpointing,
+        compile_model=args.compile,
+        bucket_batching=not args.no_bucket_batching,
         num_workers=args.num_workers,
         checkpoint_dir=args.checkpoint_dir,
         seed=args.seed,

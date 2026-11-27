@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import fields as dataclass_fields
 import json
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Union
@@ -58,8 +59,16 @@ class ConDiffPlanPipeline:
         dev = resolve_device(device)
         ckpt = torch.load(checkpoint_path, map_location=dev, weights_only=False)
 
-        model_cfg = ModelConfig(**ckpt["model_config"])
-        diff_cfg = DiffusionConfig(**ckpt["diffusion_config"])
+        raw_model_cfg = dict(ckpt["model_config"])
+        # Backward compatibility: checkpoints saved before discrete denoising lacked `enable_discrete`
+        if "enable_discrete" not in raw_model_cfg:
+            raw_model_cfg["enable_discrete"] = False
+        valid_model_keys = {f.name for f in dataclass_fields(ModelConfig)}
+        model_cfg = ModelConfig(**{k: v for k, v in raw_model_cfg.items() if k in valid_model_keys})
+
+        raw_diff_cfg = dict(ckpt["diffusion_config"])
+        valid_diff_keys = {f.name for f in dataclass_fields(DiffusionConfig)}
+        diff_cfg = DiffusionConfig(**{k: v for k, v in raw_diff_cfg.items() if k in valid_diff_keys})
 
         model = ConDiffPlanTransformer(model_cfg)
         state_key = "ema_state_dict" if (use_ema and "ema_state_dict" in ckpt) else "model_state_dict"

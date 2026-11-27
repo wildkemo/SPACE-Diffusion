@@ -11,6 +11,45 @@ import torch.nn.functional as F
 from condiffplan.config import ModelConfig
 
 
+def coords_to_bits(coords: torch.Tensor, num_bits: int = 8) -> torch.Tensor:
+    """Quantize normalized 2D coordinates in [-1, 1] to integer [0, 2^B - 1] and convert via int2bit.
+
+    Implements HouseDiffusion Section 4.1-4.2 (Analog Bits binary representation).
+    Args:
+        coords: [..., 2] continuous coordinates in [-1, 1]
+        num_bits: B (default 8 -> [0, 255], 16 bits per 2D corner)
+    Returns:
+        bits: [..., 2 * num_bits] float tensor with values in {0.0, 1.0}
+    """
+    max_val = (1 << num_bits) - 1
+    scaled = (coords.float().clamp(-1.0, 1.0) + 1.0) * (0.5 * float(max_val))
+    x_int = scaled.round().to(torch.long).clamp(0, max_val)
+    shifts = torch.arange(num_bits - 1, -1, -1, device=coords.device, dtype=torch.long)
+    bits = ((x_int.unsqueeze(-1) >> shifts) & 1).to(dtype=coords.dtype)
+    return bits.flatten(start_dim=-2)
+
+
+def bits_to_coords(bits: torch.Tensor, num_bits: int = 8) -> torch.Tensor:
+    """Binary-threshold predicted bit vectors (>= 0.5) and convert via bit2int back to [-1, 1].
+
+    Args:
+        bits: [..., 2 * num_bits] continuous or binary bit predictions
+        num_bits: B (default 8)
+    Returns:
+        coords: [..., 2] quantized coordinates in [-1, 1]
+    """
+    max_val = (1 << num_bits) - 1
+    bits_2d = bits.unflatten(-1, (2, num_bits))
+    hard_bits = (bits_2d >= 0.5).to(torch.long)
+    weights = torch.tensor(
+        [1 << (num_bits - 1 - i) for i in range(num_bits)],
+        device=bits.device,
+        dtype=torch.long,
+    )
+    x_int = (hard_bits * weights).sum(dim=-1)
+    return (x_int.to(dtype=bits.dtype) / float(max_val)) * 2.0 - 1.0
+
+
 def wall_augment(
     coords: torch.Tensor,
     next_corner_idx: torch.Tensor,
@@ -86,6 +125,52 @@ class CornerFeatureEmbedding(nn.Module):
         a_flag = has_area.to(coords_t.dtype).unsqueeze(-1)
 
         raw_feat = torch.cat([au, type_oh, eidx_oh, cidx_oh, f_flag, a_val, a_flag], dim=-1)
+        return self.norm(self.proj(raw_feat))
+
+
+class DiscreteCornerFeatureEmbedding(nn.Module):
+    """Constructs HouseDiffusion Eq. (4) discrete corner embedding: [AU(C^0), int2bit(C^0), conds]."""
+
+    def __init__(self, cfg: ModelConfig) -> None:
+        super().__init__()
+        self.cfg = cfg
+        self.proj = nn.Linear(cfg.discrete_token_input_dim, cfg.d_model)
+        self.norm = nn.LayerNorm(cfg.d_model)
+
+    def forward(
+        self,
+        coords_0: torch.Tensor,
+        elem_type: torch.Tensor,
+        elem_idx: torch.Tensor,
+        corner_idx: torch.Tensor,
+        next_corner_idx: torch.Tensor,
+        fixed_mask: torch.Tensor,
+        norm_area: torch.Tensor,
+        has_area: torch.Tensor,
+    ) -> torch.Tensor:
+        au = wall_augment(coords_0, next_corner_idx, num_points=self.cfg.wall_aug_points)
+        bits = coords_to_bits(coords_0, num_bits=self.cfg.discrete_num_bits).to(coords_0.dtype)
+
+        type_oh = F.one_hot(
+            elem_type.clamp(0, self.cfg.num_elem_types - 1),
+            num_classes=self.cfg.num_elem_types,
+        ).to(coords_0.dtype)
+
+        eidx_oh = F.one_hot(
+            elem_idx.clamp(0, self.cfg.max_elements - 1),
+            num_classes=self.cfg.max_elements,
+        ).to(coords_0.dtype)
+
+        cidx_oh = F.one_hot(
+            corner_idx.clamp(0, self.cfg.max_corners - 1),
+            num_classes=self.cfg.max_corners,
+        ).to(coords_0.dtype)
+
+        f_flag = fixed_mask.to(coords_0.dtype).unsqueeze(-1)
+        a_val = norm_area.to(coords_0.dtype).unsqueeze(-1)
+        a_flag = has_area.to(coords_0.dtype).unsqueeze(-1)
+
+        raw_feat = torch.cat([au, bits, type_oh, eidx_oh, cidx_oh, f_flag, a_val, a_flag], dim=-1)
         return self.norm(self.proj(raw_feat))
 
 

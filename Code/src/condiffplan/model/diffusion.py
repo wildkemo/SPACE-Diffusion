@@ -9,6 +9,21 @@ import torch
 import torch.nn as nn
 
 from condiffplan.config import DiffusionConfig
+from condiffplan.model.embeddings import bits_to_coords, coords_to_bits
+
+
+def _slice_batch(batch: Dict[str, torch.Tensor], mask: torch.Tensor) -> Dict[str, torch.Tensor]:
+    """Slice tensor entries in a collated batch along dim 0 using a boolean mask."""
+    return {k: v[mask] for k, v in batch.items() if torch.is_tensor(v)}
+
+
+def _discrete_settings(model: nn.Module) -> tuple[bool, int]:
+    """Read (enable_discrete, discrete_num_bits) safely even if model is torch.compile wrapped."""
+    base = getattr(model, "_orig_mod", model)
+    enabled = bool(getattr(base, "enable_discrete", False))
+    cfg = getattr(base, "cfg", None)
+    num_bits = int(getattr(cfg, "discrete_num_bits", 8)) if cfg is not None else 8
+    return enabled, num_bits
 
 
 def make_cosine_beta_schedule(num_timesteps: int = 1000, s: float = 0.008) -> torch.Tensor:
@@ -98,7 +113,12 @@ class ConditionalGaussianDiffusion(nn.Module):
         batch: Dict[str, torch.Tensor],
         t: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Simple L2 noise prediction loss Eq. (5) over unfixed, non-padded corners."""
+        """Dual continuous + discrete L2 loss (ConDiffPlan Eq. 5 + HouseDiffusion Section 4.2).
+
+        - Continuous branch: L2 loss between true noise and predicted noise on all timesteps.
+        - Discrete branch: L2 loss between binary-encoded ground-truth x_0 and predicted bits
+          on samples with t < discrete_train_t (default 20), with equal weight.
+        """
         x_0 = batch["coords"]
         fixed_mask = batch["fixed_mask"]
         padding_mask = batch["padding_mask"]
@@ -116,7 +136,62 @@ class ConditionalGaussianDiffusion(nn.Module):
         active_f = active.unsqueeze(-1).to(x_0.dtype)
         sq_err = ((noise - pred_noise) ** 2) * active_f
         denom = (active_f.sum() * 2.0).clamp(min=1.0)
-        return sq_err.sum() / denom
+        loss_cont = sq_err.sum() / denom
+
+        # HouseDiffusion discrete denoising loss (only for t < discrete_train_t)
+        enable_discrete, num_bits = _discrete_settings(model)
+        if enable_discrete and self.cfg.discrete_loss_weight > 0.0:
+            disc_mask = t < self.cfg.discrete_train_t
+            if bool(disc_mask.any().item()):
+                batch_sub = _slice_batch(batch, disc_mask)
+                x_0_sub = batch_sub["coords"]
+                x_t_sub = x_t[disc_mask]
+                t_sub = t[disc_mask]
+                pred_noise_sub = pred_noise[disc_mask]
+                fixed_sub = batch_sub["fixed_mask"]
+                pad_sub = batch_sub["padding_mask"]
+
+                # Compute continuous x_0 estimate and detach before discrete branch
+                x_0_cont = self.predict_x0_from_eps(x_t_sub, t_sub, pred_noise_sub)
+                if self.cfg.clip_denoised:
+                    x_0_cont = torch.clamp(x_0_cont, -self.cfg.clip_range, self.cfg.clip_range)
+                x_0_cont = torch.where(fixed_sub.unsqueeze(-1), x_0_sub, x_0_cont).detach()
+
+                pred_bits = model.forward_discrete(x_0_cont, t_sub, batch_sub)  # type: ignore[operator]
+                gt_bits = coords_to_bits(x_0_sub, num_bits=num_bits).to(pred_bits.dtype)
+
+                active_sub = ((~fixed_sub) & pad_sub).unsqueeze(-1).to(pred_bits.dtype)
+                disc_sq_err = ((gt_bits - pred_bits) ** 2) * active_sub
+                disc_denom = (active_sub.sum() * float(2 * num_bits)).clamp(min=1.0)
+                loss_disc = disc_sq_err.sum() / disc_denom
+                return loss_cont + float(self.cfg.discrete_loss_weight) * loss_disc
+
+        return loss_cont
+
+    @torch.no_grad()
+    def _refine_x0_discrete(
+        self,
+        model: nn.Module,
+        x_0_pred: torch.Tensor,
+        t: torch.Tensor,
+        t_index: int,
+        batch: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """Apply HouseDiffusion discrete branch refinement when t < discrete_sample_t."""
+        fixed_mask = batch["fixed_mask"].unsqueeze(-1)
+        x_fixed = batch["coords"]
+        padding_mask = batch["padding_mask"].unsqueeze(-1).to(x_0_pred.dtype)
+
+        # Ensure fixed corners are exact before entering the discrete branch
+        x_0_pred = torch.where(fixed_mask, x_fixed, x_0_pred) * padding_mask
+
+        enable_discrete, num_bits = _discrete_settings(model)
+        if enable_discrete and t_index < self.cfg.discrete_sample_t:
+            pred_bits = model.forward_discrete(x_0_pred, t, batch)  # type: ignore[operator]
+            x_0_disc = bits_to_coords(pred_bits, num_bits=num_bits).to(x_0_pred.dtype)
+            x_0_pred = torch.where(fixed_mask, x_fixed, x_0_disc) * padding_mask
+
+        return x_0_pred
 
     @torch.no_grad()
     def p_sample_step(
@@ -127,13 +202,14 @@ class ConditionalGaussianDiffusion(nn.Module):
         batch: Dict[str, torch.Tensor],
         generator: Optional[torch.Generator] = None,
     ) -> torch.Tensor:
-        """Single reverse DDPM transition p_theta(x_{t-1} | x_t) with fixed-corner clamping."""
+        """Single reverse DDPM transition p_theta(x_{t-1} | x_t) with discrete refinement and fixed clamping."""
         bsz = x_t.shape[0]
         t = torch.full((bsz,), t_index, device=x_t.device, dtype=torch.long)
         eps = model(x_t, t, batch)
         x_0_pred = self.predict_x0_from_eps(x_t, t, eps)
         if self.cfg.clip_denoised:
             x_0_pred = torch.clamp(x_0_pred, -self.cfg.clip_range, self.cfg.clip_range)
+        x_0_pred = self._refine_x0_discrete(model, x_0_pred, t, t_index, batch)
 
         coef1 = self._extract(self.posterior_mean_coef1, t, x_t.shape)
         coef2 = self._extract(self.posterior_mean_coef2, t, x_t.shape)
@@ -144,7 +220,7 @@ class ConditionalGaussianDiffusion(nn.Module):
             z = torch.randn(x_t.shape, dtype=x_t.dtype, device=x_t.device, generator=generator)
             x_prev = mean + torch.exp(0.5 * log_var) * z
         else:
-            x_prev = mean
+            x_prev = x_0_pred
 
         fixed_mask = batch["fixed_mask"].unsqueeze(-1)
         x_fixed = batch["coords"]
@@ -200,6 +276,7 @@ class ConditionalGaussianDiffusion(nn.Module):
             x_0_pred = self.predict_x0_from_eps(x_t, t_tensor, eps)
             if self.cfg.clip_denoised:
                 x_0_pred = torch.clamp(x_0_pred, -self.cfg.clip_range, self.cfg.clip_range)
+            x_0_pred = self._refine_x0_discrete(model, x_0_pred, t_tensor, t_cur, batch)
 
             if t_prev < 0:
                 x_t = x_0_pred

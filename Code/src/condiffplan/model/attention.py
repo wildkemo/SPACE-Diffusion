@@ -9,11 +9,35 @@ Combines three parallel attention branches in every layer:
 
 from __future__ import annotations
 
+from typing import Optional, Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from condiffplan.config import ModelConfig
+
+
+def prepare_tri_branch_masks(
+    padding_mask: torch.Tensor,
+    room_mask: torch.Tensor,
+    rel_mask: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Precompute boolean SDPA attention masks once per forward pass across all layers.
+
+    Returns:
+        global_allow: [B, 1, M, M] bool (True = attend)
+        room_allow:   [B, 1, M, M] bool (True = attend)
+        rel_allow:    [B, 1, M, M] bool (True = attend)
+    """
+    bsz, seqlen = padding_mask.shape
+    diag = torch.eye(seqlen, device=padding_mask.device, dtype=torch.bool).unsqueeze(0)  # [1, M, M]
+
+    valid_keys = padding_mask.unsqueeze(1)  # [B, 1, M]
+    global_allow = (valid_keys.expand(bsz, seqlen, seqlen) | diag).unsqueeze(1)
+    room_allow = ((room_mask & valid_keys) | diag).unsqueeze(1)
+    rel_allow = ((rel_mask & valid_keys) | diag).unsqueeze(1)
+    return global_allow, room_allow, rel_allow
 
 
 class TriBranchAttention(nn.Module):
@@ -29,10 +53,8 @@ class TriBranchAttention(nn.Module):
         self.head_dim = cfg.d_model // cfg.n_heads
         self.dropout_p = cfg.dropout
 
-        # Three separate sets of Q, K, V matrices per layer (Section 3.4.3)
-        self.qkv_global = nn.Linear(cfg.d_model, 3 * cfg.d_model)
-        self.qkv_room = nn.Linear(cfg.d_model, 3 * cfg.d_model)
-        self.qkv_rel = nn.Linear(cfg.d_model, 3 * cfg.d_model)
+        # Fused Q, K, V projection for all 3 branches (Global + Room + Relational) in 1 GEMM
+        self.qkv_all = nn.Linear(cfg.d_model, 9 * cfg.d_model)
 
         # Learnable typed-edge relative attention bias for the relational branch
         self.edge_bias = nn.Embedding(cfg.num_rel_edge_types, cfg.n_heads)
@@ -41,11 +63,35 @@ class TriBranchAttention(nn.Module):
         self.out_proj = nn.Linear(cfg.d_model, cfg.d_model)
         self.resid_dropout = nn.Dropout(cfg.dropout)
 
-    def _split_qkv(self, qkv_proj: nn.Linear, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        bsz, seqlen, _ = x.shape
-        qkv = qkv_proj(x).view(bsz, seqlen, 3, self.n_heads, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)  # [3, B, H, M, D_h]
-        return qkv[0], qkv[1], qkv[2]
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ) -> None:
+        """Backward-compatible loader: pack legacy qkv_global/qkv_room/qkv_rel into qkv_all."""
+        g_w = prefix + "qkv_global.weight"
+        r_w = prefix + "qkv_room.weight"
+        rel_w = prefix + "qkv_rel.weight"
+        all_w = prefix + "qkv_all.weight"
+        if all_w not in state_dict and g_w in state_dict and r_w in state_dict and rel_w in state_dict:
+            state_dict[all_w] = torch.cat(
+                [state_dict.pop(g_w), state_dict.pop(r_w), state_dict.pop(rel_w)], dim=0
+            )
+            g_b = prefix + "qkv_global.bias"
+            r_b = prefix + "qkv_room.bias"
+            rel_b = prefix + "qkv_rel.bias"
+            if g_b in state_dict and r_b in state_dict and rel_b in state_dict:
+                state_dict[prefix + "qkv_all.bias"] = torch.cat(
+                    [state_dict.pop(g_b), state_dict.pop(r_b), state_dict.pop(rel_b)], dim=0
+                )
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+        )
 
     def forward(
         self,
@@ -54,6 +100,7 @@ class TriBranchAttention(nn.Module):
         room_mask: torch.Tensor,
         rel_mask: torch.Tensor,
         rel_edge_type: torch.Tensor,
+        precomputed_masks: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         """Compute summed Global + Room-wise + Relational self-attention.
 
@@ -62,42 +109,35 @@ class TriBranchAttention(nn.Module):
             padding_mask: [B, M] bool (True = valid token)
             room_mask: [B, M, M] bool (True = same element)
             rel_mask: [B, M, M] bool (True = connected in graph)
-            rel_edge_type: [B, M, M] long (relational edge type ID in 0..7)
+            rel_edge_type: [B, M, M] uint8 or long (relational edge type ID in 0..7)
+            precomputed_masks: optional (global_allow, room_allow, rel_allow) boolean masks
         """
         bsz, seqlen, _ = x.shape
         dtype = x.dtype
-        neg_inf = torch.finfo(dtype).min
 
-        # Valid key positions: [B, 1, 1, M]
-        valid_keys = padding_mask.unsqueeze(1).unsqueeze(2)
-        diag = torch.eye(seqlen, device=x.device, dtype=torch.bool).unsqueeze(0)  # [1, M, M]
+        if precomputed_masks is not None:
+            global_allow, room_allow, rel_allow = precomputed_masks
+        else:
+            global_allow, room_allow, rel_allow = prepare_tri_branch_masks(
+                padding_mask=padding_mask,
+                room_mask=room_mask,
+                rel_mask=rel_mask,
+            )
 
-        # 1. Global attention bias: [B, 1, M, M]
-        global_allow = valid_keys.expand(bsz, 1, seqlen, seqlen) | diag.unsqueeze(1)
-        global_bias = torch.where(global_allow, torch.zeros((), device=x.device, dtype=dtype), neg_inf)
-
-        # 2. Room-wise attention bias: [B, 1, M, M]
-        room_allow = (room_mask & padding_mask.unsqueeze(1)) | diag
-        room_bias = torch.where(
-            room_allow.unsqueeze(1),
-            torch.zeros((), device=x.device, dtype=dtype),
-            neg_inf,
-        )
-
-        # 3. Relational attention bias with typed-edge embedding: [B, H, M, M]
-        rel_allow = (rel_mask & padding_mask.unsqueeze(1)) | diag
-        eb = self.edge_bias(rel_edge_type).permute(0, 3, 1, 2).to(dtype)  # [B, H, M, M]
-        rel_bias = torch.where(rel_allow.unsqueeze(1), eb, neg_inf)
+        # Relational attention bias with learnable typed-edge embedding: [B, H, M, M]
+        edge_ids = rel_edge_type if rel_edge_type.dtype == torch.long else rel_edge_type.long()
+        eb = self.edge_bias(edge_ids).permute(0, 3, 1, 2).to(dtype)
+        rel_bias = eb.masked_fill(~rel_allow, float("-inf"))
 
         drop_p = self.dropout_p if self.training else 0.0
 
-        qg, kg, vg = self._split_qkv(self.qkv_global, x)
-        out_global = F.scaled_dot_product_attention(qg, kg, vg, attn_mask=global_bias, dropout_p=drop_p)
+        # Single fused projection -> [9, B, H, M, D_h]
+        qkv = self.qkv_all(x).view(bsz, seqlen, 9, self.n_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        qg, kg, vg, qr, kr, vr, qrel, krel, vrel = qkv.unbind(dim=0)
 
-        qr, kr, vr = self._split_qkv(self.qkv_room, x)
-        out_room = F.scaled_dot_product_attention(qr, kr, vr, attn_mask=room_bias, dropout_p=drop_p)
-
-        qrel, krel, vrel = self._split_qkv(self.qkv_rel, x)
+        out_global = F.scaled_dot_product_attention(qg, kg, vg, attn_mask=global_allow, dropout_p=drop_p)
+        out_room = F.scaled_dot_product_attention(qr, kr, vr, attn_mask=room_allow, dropout_p=drop_p)
         out_rel = F.scaled_dot_product_attention(qrel, krel, vrel, attn_mask=rel_bias, dropout_p=drop_p)
 
         # Sum the results of the three attentions (Section 3.4.3)
